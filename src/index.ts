@@ -11,6 +11,10 @@ export {
   createViemWalletAdapter,
   SolanaWalletAdapter,
   createSolanaWalletAdapter,
+  normalizeWalletError,
+  withNormalizedWalletErrors,
+  assertWalletNetwork,
+  watchWalletEvents,
 } from './wallet';
 export type {
   WalletAdapterChain,
@@ -22,6 +26,12 @@ export type {
   FreighterWalletApi,
   ViemWalletClient,
   SolanaWalletAdapterLike,
+  WalletEvent,
+  WalletEventListener,
+  WalletEventSource,
+  Eip1193EventProvider,
+  SolanaWalletEventEmitter,
+  FreighterWalletWatcher,
 } from './wallet';
 
 export { setTracer, getTracer, withSpan, NOOP_TRACER } from './telemetry';
@@ -61,4 +71,11 @@ export {
   ContractRevertError,
   InsufficientBalanceError,
   UnsupportedAssetError,
+  WraithWalletError,
+  WalletNotConnectedError,
+  WalletUserRejectedError,
+  WalletWrongNetworkError,
+  WalletUnavailableError,
+  WalletRequestFailedError,
 } from './errors';
+export type { WalletErrorDetails, WalletWrongNetworkDetails } from './errors';
