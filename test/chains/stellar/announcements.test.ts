@@ -579,16 +579,17 @@ describe('parallel chunking ordering guarantee', () => {
       call += 1;
       const body = init?.body ? JSON.parse(init.body.toString()) : undefined;
       // 1: ledger-window probe, 2: latest-ledger lookup, 3+: chunk pages.
-      if (call === 1) return { json: async () => makeProbeSuccess() } as Response;
-      if (call === 2) return { json: async () => ({ result: { sequence: 100 } }) } as Response;
+      if (call === 1) return { json: async () => rpcEnvelope(makeProbeSuccess(), 0) } as Response;
+      if (call === 2)
+        return { json: async () => rpcEnvelope({ result: { sequence: 100 } }, 1) } as Response;
       chunkStarts.push(body?.params?.startLedger);
-      return { json: async () => ({ result: { events: [], cursor: undefined } }) } as Response;
+      return {
+        json: async () => rpcEnvelope({ result: { events: [], cursor: undefined } }, 2),
+      } as Response;
     });
     vi.stubGlobal('fetch', fetchSpy);
 
-    const { MAX_COLD_SCAN_PARALLELISM } = await import(
-      '../../../src/chains/stellar/announcements'
-    );
+    const { MAX_COLD_SCAN_PARALLELISM } = await import('../../../src/chains/stellar/announcements');
 
     await collectStream(
       fetchAnnouncementsStream('stellar', {
@@ -656,6 +657,125 @@ describe('parallel chunking ordering guarantee', () => {
 
     // One item buffered per chunk plus the one in flight: no unbounded buffering.
     expect(Math.max(...produced)).toBeLessThanOrEqual(Math.ceil(consumed / chunkCount) + 2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AbortSignal cancellation and concurrent initial fetch
+// ---------------------------------------------------------------------------
+
+describe('AbortSignal cancellation', () => {
+  test('pre-aborted signal throws AbortError before any RPC request', async () => {
+    const { fetchAnnouncementsStream } = await import('../../../src/chains/stellar/announcements');
+    const spy = vi.fn();
+    vi.stubGlobal('fetch', spy);
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const stream = fetchAnnouncementsStream('stellar', { signal: controller.signal });
+    await expect(stream.next()).rejects.toMatchObject({ name: 'AbortError' });
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  test('threads the signal into fetch and cancels an in-flight page request', async () => {
+    const { fetchAnnouncementsStream } = await import('../../../src/chains/stellar/announcements');
+    const controller = new AbortController();
+
+    const blockingFetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      if (body.method === 'getEvents' && body.id === 0) {
+        return Promise.resolve({
+          json: async () => rpcEnvelope(makeProbeSuccess(), 0),
+        } as Response);
+      }
+      if (body.method === 'getLatestLedger') {
+        return Promise.resolve({
+          json: async () => rpcEnvelope({ result: { sequence: 100 } }, 1),
+        } as Response);
+      }
+      // Simulate a page request that stays in flight until it is aborted.
+      const signal = init?.signal;
+      return new Promise<Response>((_resolve, reject) => {
+        const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+        if (signal?.aborted) {
+          onAbort();
+          return;
+        }
+        signal?.addEventListener('abort', onAbort, { once: true });
+        setTimeout(() => controller.abort(), 0);
+      });
+    });
+    vi.stubGlobal('fetch', blockingFetch);
+
+    await expect(
+      collectStream(fetchAnnouncementsStream('stellar', { signal: controller.signal })),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    const pageCall = blockingFetch.mock.calls.find(
+      ([, init]) => JSON.parse(String(init?.body)).id === 2,
+    );
+    expect(pageCall).toBeDefined();
+    expect(pageCall?.[1]?.signal).toBe(controller.signal);
+  });
+
+  test('mergeOrdered pulls the first item from every iterator concurrently', async () => {
+    const { mergeOrdered } = await import('../../../src/chains/stellar/announcements');
+
+    const started: number[] = [];
+    const gates: Array<() => void> = [];
+    const makeChunk = (index: number) =>
+      (async function* () {
+        started.push(index);
+        await new Promise<void>((resolve) => gates.push(resolve));
+        yield { item: index, key: index };
+      })();
+
+    const iterator = mergeOrdered([makeChunk(0), makeChunk(1), makeChunk(2)])[
+      Symbol.asyncIterator
+    ]();
+    const first = iterator.next();
+
+    // Sequential initialisation would only have started the first chunk here.
+    expect([...started].sort((a, b) => a - b)).toEqual([0, 1, 2]);
+
+    gates.forEach((release) => release());
+    await expect(first).resolves.toMatchObject({ done: false, value: 0 });
+    await iterator.return?.(undefined);
+  });
+
+  test('mergeOrdered closes every chunk iterator when the signal aborts', async () => {
+    const { mergeOrdered } = await import('../../../src/chains/stellar/announcements');
+    const controller = new AbortController();
+    let closed = 0;
+
+    const makeChunk = (start: number) =>
+      (async function* () {
+        try {
+          for (let i = 0; ; i++) {
+            await sleep(1);
+            yield { item: start + i, key: start + i };
+          }
+        } finally {
+          closed++;
+        }
+      })();
+
+    const seen: number[] = [];
+    await expect(
+      (async () => {
+        for await (const item of mergeOrdered(
+          [makeChunk(1), makeChunk(10), makeChunk(20)],
+          controller.signal,
+        )) {
+          seen.push(item);
+          if (seen.length === 2) controller.abort();
+        }
+      })(),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(seen).toHaveLength(2);
+    expect(closed).toBe(3);
   });
 });
 
